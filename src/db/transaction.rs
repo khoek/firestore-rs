@@ -19,8 +19,16 @@ use gcloud_sdk::tonic::Code;
 use std::time::Duration;
 use tracing::*;
 
+// Drop cannot await. Bound best-effort lock release by both concurrency and
+// duration; overload/shutdown falls back to Firestore's transaction expiry.
+const DROP_ROLLBACK_TIMEOUT: Duration = Duration::from_secs(5);
+static DROP_ROLLBACK_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(64);
+
 #[cfg(test)]
 mod commit_tests;
+
+#[cfg(test)]
+mod cancellation_tests;
 
 #[derive(Debug, Clone)]
 pub struct FirestoreTransactionData {
@@ -256,7 +264,6 @@ impl<'a> FirestoreTransaction<'a> {
     /// Returns an error if the `Rollback` request fails; the queued writes are discarded locally
     /// either way.
     pub async fn rollback(mut self) -> FirestoreResult<()> {
-        self.finished = true;
         let request = gcloud_sdk::tonic::Request::new(RollbackRequest {
             database: self.db.get_database_path().clone(),
             transaction: self.data.transaction_id.clone(),
@@ -265,7 +272,11 @@ impl<'a> FirestoreTransaction<'a> {
                 .resolve_request_options(self.request_options.as_ref()),
         });
 
-        self.db.client().get().rollback(request).await?;
+        let response = self.db.client().get().rollback(request).await;
+        // A completed response, including an error, must not acquire a new retry
+        // policy via Drop. Cancellation before this point still needs cleanup.
+        self.finished = true;
+        response?;
 
         self.data.transaction_span.in_scope(|| {
             debug!("Transaction has been rolled back.");
@@ -353,11 +364,53 @@ impl FirestoreTransactionOps for FirestoreTransaction<'_> {
 
 impl<'a> Drop for FirestoreTransaction<'a> {
     fn drop(&mut self) {
-        if !self.finished {
-            self.data
-                .transaction_span
-                .in_scope(|| warn!("Transaction was neither committed nor rolled back."));
+        if self.finished {
+            return;
         }
+        let span = self.data.transaction_span.clone();
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            span.in_scope(|| {
+                warn!("Unfinished transaction cannot roll back without an async runtime.")
+            });
+            return;
+        };
+        let Ok(permit) = DROP_ROLLBACK_SLOTS.try_acquire() else {
+            span.in_scope(|| {
+                warn!("Unfinished transaction rollback capacity is exhausted; locks will expire.")
+            });
+            return;
+        };
+        let mut client = self.db.client().get();
+        let mut request = gcloud_sdk::tonic::Request::new(RollbackRequest {
+            database: self.db.get_database_path().clone(),
+            transaction: self.data.transaction_id.clone(),
+            request_options: self
+                .db
+                .resolve_request_options(self.request_options.as_ref()),
+        });
+        request.set_timeout(DROP_ROLLBACK_TIMEOUT);
+        span.in_scope(|| warn!("Unfinished transaction was dropped; attempting bounded rollback."));
+        // The runtime owns this single bounded cleanup attempt. It retains no
+        // transaction writes and cannot replay a callback or undo a commit.
+        drop(
+            runtime.spawn(
+                async move {
+                    let _permit = permit;
+                    match tokio::time::timeout(DROP_ROLLBACK_TIMEOUT, client.rollback(request))
+                        .await
+                    {
+                        Ok(Ok(_)) => debug!("Dropped transaction has been rolled back."),
+                        Ok(Err(error)) => {
+                            warn!(code = ?error.code(), "Dropped transaction rollback failed.")
+                        }
+                        Err(_) => {
+                            warn!("Dropped transaction rollback timed out; locks will expire.")
+                        }
+                    }
+                }
+                .instrument(span),
+            ),
+        );
     }
 }
 
