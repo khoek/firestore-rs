@@ -113,42 +113,19 @@ async fn started(wait: Wait) -> (FirestoreListener<TestDb, TestDb>, TestDb) {
     (listener, db)
 }
 
-async fn assert_graceful_shutdown(wait: Wait) {
+async fn assert_cancelled_shutdown(wait: Wait) {
     let (mut listener, db) = started(wait).await;
-    {
-        let shutdown = listener.shutdown();
-        futures::pin_mut!(shutdown);
-        assert!(futures::poll!(shutdown.as_mut()).is_pending());
-        tokio::task::yield_now().await;
-        assert!(futures::poll!(shutdown.as_mut()).is_pending());
-        assert!(!db.stored.load(Ordering::Relaxed));
-        db.release.add_permits(1);
-        within(shutdown).await.unwrap();
-    }
-    assert!(db.stored.load(Ordering::Relaxed));
+    within(listener.shutdown()).await.unwrap();
+    assert!(!db.stored.load(Ordering::Relaxed));
+    assert!(listener.shutdown_handle.is_none());
     listener.shutdown().await.unwrap();
 }
 
 #[tokio::test]
-async fn shutdown_waits_for_the_callback_and_for_resume_token_storage() {
+async fn shutdown_cancels_callback_and_resume_token_storage() {
     for wait in [Wait::Callback, Wait::Storage] {
-        assert_graceful_shutdown(wait).await;
+        assert_cancelled_shutdown(wait).await;
     }
-}
-
-#[tokio::test]
-async fn interrupted_shutdown_retains_task_for_join() {
-    let (mut listener, db) = started(Wait::Callback).await;
-    {
-        let shutdown = listener.shutdown();
-        futures::pin_mut!(shutdown);
-        assert!(futures::poll!(shutdown).is_pending());
-    }
-    assert!(listener.shutdown_handle.is_some());
-    db.release.add_permits(1);
-    within(listener.shutdown()).await.unwrap();
-    assert!(db.stored.load(Ordering::Relaxed));
-    assert!(listener.shutdown_handle.is_none());
 }
 
 /// A fake server that logs `Listen closed` once the client closes a Listen request; see

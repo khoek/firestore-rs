@@ -20,11 +20,14 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
-use tokio::task::JoinHandle;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 use tracing::*;
 
 #[cfg(test)]
 mod lifecycle_tests;
+
+#[cfg(test)]
+mod cancellation_tests;
 
 #[derive(Debug, Clone, Builder)]
 pub struct FirestoreListenerTargetParams {
@@ -343,7 +346,8 @@ where
     listener_params: FirestoreListenerParams,
     targets: FirestoreListenerTargetsState,
     shutdown_flag: Arc<AtomicBool>,
-    shutdown_handle: Option<JoinHandle<()>>,
+    shutdown_handle: Option<AbortOnDropHandle<()>>,
+    cancellation: CancellationToken,
     /// Created up front rather than in `start`, so that targets can be added and removed before,
     /// during and after the listener runs.
     control_writer: Arc<UnboundedSender<FirestoreListenerControl>>,
@@ -375,6 +379,7 @@ where
             targets: Arc::new(std::sync::RwLock::new(HashMap::new())),
             shutdown_flag: Arc::new(AtomicBool::new(false)),
             shutdown_handle: None,
+            cancellation: CancellationToken::new(),
             control_writer: Arc::new(control_writer),
             control_reader: Some(control_reader),
         })
@@ -553,7 +558,7 @@ where
             }
         }
 
-        self.shutdown_handle = Some(tokio::spawn(Self::listener_loop(
+        let work = Self::listener_loop(
             self.db.clone(),
             self.storage.clone(),
             self.shutdown_flag.clone(),
@@ -561,7 +566,12 @@ where
             self.listener_params.clone(),
             control_reader,
             cb,
-        )));
+        );
+        let cancellation = self.cancellation.clone();
+        self.shutdown_handle = Some(AbortOnDropHandle::new(tokio::spawn(async move {
+            // Cover connection establishment, callbacks, storage and retry waits as well as reads.
+            cancellation.run_until_cancelled(work).await;
+        })));
         Ok(())
     }
 
@@ -573,6 +583,7 @@ where
     pub async fn shutdown(&mut self) -> FirestoreResult<()> {
         debug!("Shutting down Firestore listener...");
         self.shutdown_flag.store(true, Ordering::Relaxed);
+        self.cancellation.cancel();
         self.control_writer
             .send(FirestoreListenerControl::Shutdown)
             .ok();
