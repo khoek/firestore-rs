@@ -1,5 +1,6 @@
 use super::*;
 use crate::db::fake_firestore::{FakeFirestore, FakeResponse};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
@@ -180,4 +181,17 @@ async fn ended_response_closes_http2_request_while_held() {
     assert!(within(response.next()).await.is_none());
     within(server.wait_for_calls(1)).await;
     assert_eq!(server.calls(), vec!["Listen closed"]);
+}
+
+#[tokio::test]
+async fn abort_cancels_callback_and_storage_and_can_be_joined() {
+    for wait in [Wait::Callback, Wait::Storage] {
+        let (mut listener, db) = started(wait).await;
+        listener.abort();
+        within(listener.shutdown()).await.unwrap();
+        assert!(!db.stored.load(Ordering::Relaxed));
+        assert!(listener.shutdown_handle.is_none());
+        listener.abort();
+        listener.shutdown().await.unwrap();
+    }
 }
