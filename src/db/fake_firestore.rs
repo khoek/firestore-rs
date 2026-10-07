@@ -39,8 +39,9 @@ pub(super) enum FakeResponse {
     Drop,
     /// The server never answers and keeps the stream open, simulating a call stuck in flight
     /// until the client gives up on it.
-    #[cfg(feature = "admin")]
     Hang,
+    /// Hold the response until the test releases it.
+    Delayed(Arc<Notify>, Box<FakeResponse>),
 }
 
 impl FakeResponse {
@@ -308,10 +309,14 @@ async fn answer(
         body.flow_control().release_capacity(chunk.len()).unwrap();
         bytes.extend_from_slice(&chunk);
     }
-    let (call, response) = handler(&method, bytes.get(5..).unwrap_or_default());
+    let (call, mut response) = handler(&method, bytes.get(5..).unwrap_or_default());
     calls.send_modify(|calls| calls.push(call));
     if listening {
         return;
+    }
+    while let FakeResponse::Delayed(release, next) = response {
+        release.notified().await;
+        response = *next;
     }
     match response {
         FakeResponse::Message(message) => {
@@ -344,8 +349,8 @@ async fn answer(
                 .header("grpc-message", message);
             let _ = respond.send_response(headers.body(()).unwrap(), true);
         }
-        #[cfg(feature = "admin")]
         FakeResponse::Hang => std::future::pending::<()>().await,
+        FakeResponse::Delayed(..) => unreachable!("delays were resolved before sending"),
         FakeResponse::Drop => {
             close.notify_one();
             // Dropping `respond` while the connection is still up would reset just this stream,

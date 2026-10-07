@@ -134,3 +134,39 @@ See the complete example available [here](https://github.com/abdolence/firestore
 
 Please note that Firestore doesn't support creating documents in the transactions (generating
 document IDs automatically), so you need to use `update()` to implicitly create documents and specifying your own IDs.
+
+## Cancellation
+
+```rust,no_run
+# use firestore::*;
+# use firestore::errors::{BackoffError, FirestoreError};
+# use std::time::Duration;
+# async fn example(db: FirestoreDb) -> FirestoreResult<Option<()>> {
+let cancellation = FirestoreTransactionCancellation::new(
+    tokio::time::sleep(Duration::from_secs(10)),
+)
+.with_settlement_timeout(Duration::from_secs(5));
+
+db.run_transaction_cancellable(
+    |_, transaction| Box::pin(async move {
+        transaction.delete_by_id("items", "expired", None)?;
+        Ok::<_, BackoffError<FirestoreError>>(())
+    }),
+    FirestoreTransactionOptions::new(),
+    cancellation,
+)
+.await
+# }
+```
+
+Cancellation interrupts the callback or retry delay and rolls back the open transaction. A pending
+Begin is awaited to recover its ID for rollback. A pending Commit is awaited. The result is
+`Some(value)` if committed or `None` if cancelled without committing. Errors use `FirestoreError`,
+as with the other runners.
+
+`with_settlement_timeout` bounds the wait after cancellation; Begin and its rollback share that
+budget. Without it, there is no deadline. Expiry during Commit returns a `TransactionSettlementTimeout`
+system error. As with other Commit failures apart from `ABORTED`, the writes may have been applied;
+do not automatically retry. Rollback failures and timeouts are logged.
+
+Keep awaiting the transaction after cancellation. Dropping its future abandons cleanup.
